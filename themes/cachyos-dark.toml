@@ -1,0 +1,36 @@
+name = "CachyOS Dark"
+author = "HyprKontrol"
+
+[colors]
+background = "#111826"
+rail = "#0b111c"
+sidebar = "#0e1521"
+card = "#172136"
+raised = "#1f2f54"
+track = "#293a62"
+knob = "#c9d4ec"
+line = "#8ca0cd21"
+text = "#e6ecf8"
+text_dim = "#a9b7d6"
+text_mute = "#8c9dc4"
+accent = "#01ccff"
+on_accent = "#03161f"
+live = "#82dccc"
+warning = "#f0c674"
+critical = "#ff8080"
+
+[metrics]
+card_radius = 16
+control_radius = 12
+card_border = 0
+density = 1.0
+gap = 22
+content_padding = 36
+rail_width = 84
+sidebar_width = 284
+text_size = 14
+icon_size = 20
+icon_stroke = 1.75
+
+[layout]
+rail_labels = true

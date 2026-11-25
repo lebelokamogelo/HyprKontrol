@@ -1,0 +1,19 @@
+# Translucent surfaces. Enable blur in Hyprland to see it through.
+name = "Glass"
+author = "HyprKontrol"
+base = "cachyos-dark"
+
+[colors]
+background = "#111826b8"
+rail = "#0b111c80"
+sidebar = "#0e152166"
+card = "#1f2c4899"
+raised = "#34487acc"
+track = "#4a5d8ecc"
+line = "#b9c8ee26"
+text_mute = "#a3b2d6"
+
+[metrics]
+card_radius = 20
+control_radius = 14
+card_border = 1

@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Application
+Name=HyprKontrol
+GenericName=System Settings
+Comment=System settings for CachyOS on Hyprland
+Exec=hyprkontrol
+Icon=hyprkontrol
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=preferences;control;panel;wifi;sound;display;power;theme;
+StartupWMClass=hyprkontrol
+Actions=network;sound;displays;theme;
+
+[Desktop Action network]
+Name=Network
+Exec=hyprkontrol network
+
+[Desktop Action sound]
+Name=Sound
+Exec=hyprkontrol sound
+
+[Desktop Action displays]
+Name=Displays
+Exec=hyprkontrol displays
+
+[Desktop Action theme]
+Name=Theme
+Exec=hyprkontrol theme

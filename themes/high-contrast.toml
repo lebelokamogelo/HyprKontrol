@@ -1,0 +1,25 @@
+name = "High Contrast"
+author = "HyprKontrol"
+base = "cachyos-dark"
+
+[colors]
+background = "#000000"
+rail = "#000000"
+sidebar = "#000000"
+card = "#0b0f17"
+raised = "#143a52"
+track = "#4b5468"
+knob = "#ffffff"
+line = "#ffffff59"
+text = "#ffffff"
+text_dim = "#e3e8f2"
+text_mute = "#c3cbdb"
+accent = "#5fe0ff"
+on_accent = "#000000"
+live = "#9ff5e4"
+warning = "#ffd97a"
+critical = "#ff9c9c"
+
+[metrics]
+card_border = 1
+text_size = 15
