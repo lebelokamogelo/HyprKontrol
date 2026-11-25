@@ -21,7 +21,7 @@ This runs the formatter, clippy with warnings as errors, and the tests.
 - Arguments go into a `Cmd` as a list. A value that reaches a shell must be
   validated where the command is built.
 - Secrets never go into arguments. Use standard input or D-Bus.
-- Package operations open in a terminal. Do not pass `--noconfirm`.
+- Package operations are a `Session`. Do not pass `--noconfirm`.
 
 ## Style
 

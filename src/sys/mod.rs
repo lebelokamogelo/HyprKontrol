@@ -11,15 +11,19 @@ pub mod desktop;
 pub mod edit;
 pub mod hypr;
 pub mod idle;
+pub mod levels;
 pub mod monitor;
 pub mod network;
 pub mod op;
 pub mod packages;
+pub mod pacman;
 pub mod power;
 pub mod probe;
 pub mod region;
 pub mod rfkill;
+pub mod screen;
 pub mod services;
+pub mod session;
 pub mod storage;
 pub mod ufw;
 pub mod vpn;
@@ -29,6 +33,7 @@ use std::path::PathBuf;
 
 pub use cmd::{Cmd, query};
 pub use op::{Change, Op};
+pub use session::Session;
 
 /// A failure, already phrased for the user.
 ///

@@ -1,3 +1,5 @@
+use std::time::SystemTime;
+
 use iced::widget::row;
 use iced::{Center, Fill, Task};
 
@@ -5,36 +7,41 @@ use super::{Effect, Panel, Request};
 use crate::icon::Icon;
 use crate::sys::packages::{self, Update};
 use crate::sys::{Result, installed};
-use crate::theme::{Tone, style};
 use crate::ui::{Element, Kind, Ui};
 
 #[derive(Default)]
 pub struct State {
     updates: Option<Vec<Update>>,
-    checked: Option<String>,
+    checked: Option<SystemTime>,
     checking: bool,
+    foreign: usize,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<Update>),
+    Loaded(Vec<Update>, usize),
     Check,
     Checked(Result<Vec<Update>>),
     Upgrade,
+    UpgradeAur,
 }
 
 impl Panel for State {
     type Message = Message;
 
     fn load(&self) -> Task<Message> {
-        Task::perform(packages::cached_updates(), Message::Loaded)
+        Task::perform(
+            async { tokio::join!(packages::cached_updates(), packages::foreign()) },
+            |(updates, foreign)| Message::Loaded(updates, foreign),
+        )
     }
 
     fn update(&mut self, message: Message) -> Effect<Message> {
         match message {
-            Message::Loaded(updates) => {
-                self.checked = packages::last_sync().map(packages::ago);
+            Message::Loaded(updates, foreign) => {
+                self.checked = packages::last_check();
                 self.updates = Some(updates);
+                self.foreign = foreign;
                 Effect::none()
             }
             Message::Check => {
@@ -46,13 +53,14 @@ impl Panel for State {
                 match result {
                     Ok(updates) => {
                         self.updates = Some(updates);
-                        self.checked = Some("just now".to_owned());
+                        self.checked = Some(SystemTime::now());
                         Effect::none()
                     }
                     Err(error) => Effect::request(Request::Report(error)),
                 }
             }
-            Message::Upgrade => Effect::run(packages::upgrade()),
+            Message::Upgrade => Effect::session(Some(packages::upgrade())),
+            Message::UpgradeAur => Effect::checked(packages::upgrade_aur()),
         }
     }
 
@@ -71,7 +79,7 @@ impl Panel for State {
             (!updates.is_empty()).then_some(Message::Upgrade),
         );
         let actions = ui.actions(vec![check, upgrade]);
-        let checked = self.checked.as_deref().unwrap_or("never");
+        let checked = self.checked.map_or_else(|| "never".to_owned(), packages::ago);
         let subtitle = format!("Last checked {checked}");
         let body = if updates.is_empty() {
             ui.empty(
@@ -84,13 +92,7 @@ impl Panel for State {
             let rows = updates
                 .iter()
                 .map(|update| {
-                    let versions = row![
-                        ui.small(update.from.as_str()),
-                        ui.sized_icon(Icon::ChevronRight, Tone::Mute, 14.0),
-                        ui.small(update.to.as_str()).style(style::ink(Tone::Live)),
-                    ]
-                    .spacing(6)
-                    .align_y(Center);
+                    let versions = ui.change(update.from.as_str(), update.to.as_str());
                     ui.cell(
                         row![ui.strong(update.name.as_str()).width(Fill), versions]
                             .spacing(12)
@@ -98,9 +100,26 @@ impl Panel for State {
                     )
                 })
                 .collect();
-            ui.group(format!("{} packages", updates.len()), rows)
+            let count = updates.len();
+            ui.group(format!("{count} {}", if count == 1 { "package" } else { "packages" }), rows)
         };
-        ui.panel("Updates", subtitle, Some(actions), vec![body])
+        let mut content = vec![body];
+        if self.foreign > 0 && packages::upgrade_aur().is_some() {
+            let label = match self.foreign {
+                1 => "1 package from outside the repositories".to_owned(),
+                count => format!("{count} packages from outside the repositories"),
+            };
+            let update = ui.button("Open terminal", Kind::Secondary, Some(Message::UpgradeAur));
+            content.push(ui.group(
+                "",
+                vec![ui.row(
+                    label,
+                    "The AUR builds from source, so these update in a terminal",
+                    update,
+                )],
+            ));
+        }
+        ui.panel("Updates", subtitle, Some(actions), content)
     }
 
     fn summary(&self) -> String {

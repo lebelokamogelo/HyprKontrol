@@ -40,8 +40,8 @@ impl Panel for State {
                 self.gpus = gpus;
                 Effect::none()
             }
-            Message::Install(profile) => Effect::checked(packages::install_driver(&profile)),
-            Message::Remove(profile) => Effect::checked(packages::remove_driver(&profile)),
+            Message::Install(profile) => Effect::session(packages::install_driver(&profile)),
+            Message::Remove(profile) => Effect::session(packages::remove_driver(&profile)),
         }
     }
 
@@ -88,7 +88,7 @@ impl Panel for State {
         }));
         ui.panel(
             "Drivers",
-            "Profiles that match your hardware. Changing one opens a terminal.",
+            "Profiles that match your hardware",
             None,
             body,
         )

@@ -67,6 +67,7 @@ exists is copied to `<name>.before-hyprkontrol` before its first edit.
 | `~/.config/swaync/config.json` | Notifications |
 | `~/.config/autostart/*.desktop` | Startup applications |
 | `~/.cache/hyprkontrol/thumbnails/` | Wallpaper previews |
+| `~/.cache/hyprkontrol/checked` | Checking for updates. Empty, only its date counts |
 
 These need authorisation:
 

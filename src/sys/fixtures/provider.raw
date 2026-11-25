@@ -1,0 +1,17 @@
+[?25lresolving dependencies...
+[1;34m::[0;1m There are 2 providers available for libncursesw.so=6-64:
+[0m[1;34m::[0;1m Repository [1;35mcachyos-core-v3
+[0m[0;1m  [0m 1) ncurses
+[1;34m::[0;1m Repository [1;35mcore
+[0m[0;1m  [0m 2) ncurses
+
+Enter a number (default=1): [?25h2
+[?25l[1;34m::[0;1m There are 2 providers available for libverto-module-base:
+[0m[1;34m::[0;1m Repository [1;35mcachyos-core-v3
+[0m[0;1m  [0m 1) libverto
+[1;34m::[0;1m Repository [1;35mcore
+[0m[0;1m  [0m 2) libverto
+
+Enter a number (default=1): [?25h^C
+Interrupt signal received
+[?25h

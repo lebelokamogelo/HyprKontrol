@@ -33,8 +33,8 @@ impl Panel for State {
                 self.kernels = Some(kernels);
                 Effect::none()
             }
-            Message::Install(package) => Effect::checked(packages::install_kernel(&package)),
-            Message::Remove(package) => Effect::checked(packages::remove_kernel(&package)),
+            Message::Install(package) => Effect::session(packages::install_kernel(&package)),
+            Message::Remove(package) => Effect::session(packages::remove_kernel(&package)),
             Message::Manager => Effect::run(Cmd::new("cachyos-kernel-manager").detached()),
         }
     }
@@ -88,7 +88,7 @@ impl Panel for State {
             .collect();
         ui.panel(
             "Kernels",
-            "Installing and removing opens a terminal. Restart to switch.",
+            "Restart to switch to another one",
             manager,
             vec![ui.columns(
                 ui.group("Installed", present),

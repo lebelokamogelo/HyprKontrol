@@ -95,9 +95,10 @@ impl Cmd {
     /// Opens `script` in a terminal emulator and leaves the window open until
     /// the user has read the result.
     ///
-    /// Reserved for tools whose prompts must not be answered on the user's
-    /// behalf, package transactions above all. `script` is interpreted by `sh`,
-    /// so a caller that interpolates a value has to validate it first.
+    /// Reserved for what cannot be shown in the window: typing a password, or
+    /// reading build scripts from the AUR. Everything else that asks questions is
+    /// a [`Session`](super::Session). `script` is interpreted by `sh`, so a caller
+    /// that interpolates a value has to validate it first.
     pub fn terminal(script: impl fmt::Display) -> Self {
         let script = format!("{script}; printf '\\nPress Enter to close. '; read -r _");
         let emulator = ["kitty", "alacritty", "foot", "konsole", "ghostty", "xterm"]
@@ -197,7 +198,21 @@ impl Cmd {
         self.output().await.map(drop)
     }
 
-    fn spawn_error(&self, error: std::io::Error) -> Error {
+    /// The program and arguments for running on a terminal.
+    ///
+    /// Without a polkit agent, `pkexec` would ask for the password on that
+    /// terminal. It must not pass through this program, so that is turned off.
+    pub fn in_terminal(&self) -> (&str, Vec<&str>) {
+        let args = self.args.iter().map(String::as_str);
+        if self.elevated {
+            let own = ["--disable-internal-agent", self.program.as_str()];
+            ("pkexec", own.into_iter().chain(args).collect())
+        } else {
+            (&self.program, args.collect())
+        }
+    }
+
+    pub(super) fn spawn_error(&self, error: std::io::Error) -> Error {
         match error.kind() {
             std::io::ErrorKind::NotFound => {
                 let program = if self.elevated { "pkexec" } else { &self.program };

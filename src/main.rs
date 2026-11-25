@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod icon;
+mod job;
 mod panels;
 mod sys;
 mod theme;
@@ -71,6 +72,8 @@ fn main() -> iced::Result {
             },
             ..Default::default()
         })
+        // The application closes the window itself, once nothing is at stake.
+        .exit_on_close_request(false)
         .antialiasing(true)
         .run()
 }

@@ -1,0 +1,22 @@
+[?25l[1;34m::[0;1m Starting full system upgrade...
+[0mresolving dependencies...
+looking for conflicting packages...
+
+[0;1mPackages (2)[0m aom[38;5;243m-3.15.3-1.1[0m  bat[38;5;243m-0.26.1-3.1[0m
+
+[0;1mTotal Installed Size:[0m  14.03 MiB
+[0;1mNet Upgrade Size:    [0m   0.00 MiB
+
+[1;34m::[0;1m Proceed with installation? [Y/n] [0m[?25hy
+[?25l(0/2) checking keys in keyring                                           [----------------------------------------]   0%(1/2) checking keys in keyring                                           [####################--------------------]  50%(2/2) checking keys in keyring                                           [########################################] 100%
+(0/2) checking package integrity                                         [----------------------------------------]   0%(1/2) checking package integrity                                         [######################------------------]  56%(2/2) checking package integrity                                         [########################################] 100%
+(0/2) loading package files                                              [----------------------------------------]   0%(1/2) loading package files                                              [######################------------------]  56%(2/2) loading package files                                              [########################################] 100%
+(0/2) checking for file conflicts                                        [----------------------------------------]   0%(1/2) checking for file conflicts                                        [####################--------------------]  50%(2/2) checking for file conflicts                                        [########################################] 100%
+[1;34m::[0;1m Processing package changes...
+[0m(1/2) upgrading aom                                                      [----------------------------------------]   0%(1/2) upgrading aom                                                      [########################################] 100%
+(2/2) upgrading bat                                                      [----------------------------------------]   0%(2/2) upgrading bat                                                      [########################################] 100%
+[1;34m::[0;1m Running post-transaction hooks...
+[0m(1/1) Updating linux initcpios...
+call to execv failed (No such file or directory)
+[1;31merror: [0mcommand failed to execute correctly
+[?25h

@@ -56,7 +56,7 @@ impl Panel for State {
                 let path = config_dir().join("hypr/hyprlock.conf").display().to_string();
                 Effect::run(Cmd::new("xdg-open").arg(path).detached())
             }
-            Message::Install => Effect::checked(packages::install(&["hypridle", "hyprlock"])),
+            Message::Install => Effect::session(packages::install(&["hypridle", "hyprlock"])),
         }
     }
 

@@ -1,0 +1,20 @@
+[?25llooking for conflicting packages...
+
+[0;1mPackages (2)[0m cowsay[38;5;243m-3.8.4-1[0m  figlet[38;5;243m-2.2.5-6.1[0m
+
+[0;1mTotal Download Size: [0m  0.12 MiB
+[0;1mTotal Installed Size:[0m  0.68 MiB
+
+[1;34m::[0;1m Proceed with installation? [Y/n] [0m[?25hy
+[?25l[1;34m::[0;1m Retrieving packages...
+[0m figlet-2.2.5-6.1-x86_64
+ Total (0/2)                                   0.0   B  0.00   B/s 00:00 [----------------------------------------]   0%
+[1F cowsay-3.8.4-1-any
+ Total (0/2)                                   0.0   B  0.00   B/s 00:00 [----------------------------------------]   0%
+[3F figlet-2.2.5-6.1-x86_64.pkg.tar.zst failed to download[K[1E cowsay-3.8.4-1-any.pkg.tar.zst failed to download[K[1E Total (2/2)                                 127.6 KiB   125 MiB/s 00:00 [########################################] 100%
+[1;31merror: [0mfailed retrieving file 'figlet-2.2.5-6.1-x86_64.pkg.tar.zst' from 127.0.0.1:9 : Failed to connect to 127.0.0.1:9 after 0 ms: Could not connect to server
+[1;31merror: [0mfailed retrieving file 'cowsay-3.8.4-1-any.pkg.tar.zst' from 127.0.0.1:9 : Failed to connect to 127.0.0.1:9 after 0 ms: Could not connect to server
+[1;33mwarning: [0mfailed to retrieve some files
+[1;31merror: [0mfailed to commit transaction (download library error)
+Errors occurred, no packages were upgraded.
+[?25h

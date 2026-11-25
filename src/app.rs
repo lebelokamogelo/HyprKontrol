@@ -3,15 +3,17 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use iced::futures::{SinkExt, Stream};
+use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::widget::text::Wrapping;
 use iced::widget::{button, column, container, operation, responsive, row, scrollable};
 use iced::{Center, Fill, Size, Subscription, Task, keyboard, stream, window};
+use iced_runtime::{Action, task};
 
 use crate::config::Config;
 use crate::icon::Icon;
+use crate::job::{self, Job, Next};
 use crate::panels::{self, Effect, Id, Panels, Request, Section, Watch, home};
-use crate::sys::{self, Op, desktop};
+use crate::sys::{self, Op, Session, desktop};
 use crate::theme::style::{self, Tone};
 use crate::theme::{Library, Theme, library};
 use crate::ui::{Element, Kind, Ui, Width};
@@ -26,6 +28,8 @@ pub struct App {
     /// The panel last open in each section, so the rail returns to it.
     visited: Vec<(Section, Id)>,
     receipt: Option<Receipt>,
+    /// The package operation under way, or the last one until it is dismissed.
+    job: Option<Job>,
     focused: bool,
     /// A theme is being edited, which a reload must not interrupt.
     previewing: bool,
@@ -45,6 +49,8 @@ enum Progress {
     Running,
     Done,
     Failed(String),
+    /// Called off by the user.
+    Stopped(String),
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +66,8 @@ pub enum Message {
     Focused(bool),
     ThemesChanged,
     Desktop(bool),
+    Job(job::Message),
+    CloseRequested(window::Id),
 }
 
 impl App {
@@ -69,7 +77,7 @@ impl App {
         let library = Library::load(&library::dir());
         let active = panel.or_else(|| Id::from_key(&config.start)).unwrap_or(Id::Home);
         let theme = Theme::new(library.get_or_default(config.active_theme(true)).clone());
-        let app = Self {
+        let mut app = Self {
             config,
             library,
             theme,
@@ -78,13 +86,17 @@ impl App {
             active,
             visited: Vec::new(),
             receipt: None,
+            job: None,
             // The compositor says so once it is. A window that opens on another
             // workspace must not start polling before anyone looks at it.
             focused: false,
             previewing: false,
         };
+        let first = app.prime(app.panels.load(active));
         let load = Task::batch([
-            app.load_section(active),
+            first,
+            app.load_neighbours(active),
+            app.preload(),
             app.reveal(active),
             Task::perform(desktop::look(), |look| Message::Desktop(look.dark)),
         ]);
@@ -101,9 +113,62 @@ impl App {
 
     /// Loads a panel first, then its neighbours for their sidebar summaries.
     fn load_section(&self, active: Id) -> Task<Message> {
-        let load = |id: Id| self.panels.load(id).map(Message::Panel);
-        let neighbours = active.section().panels(&self.config).filter(|id| *id != active).map(load);
-        Task::batch(std::iter::once(load(active)).chain(neighbours))
+        let load = self.panels.load(active).map(Message::Panel);
+        Task::batch([load, self.load_neighbours(active)])
+    }
+
+    fn load_neighbours(&self, active: Id) -> Task<Message> {
+        let neighbours = active.section().panels(&self.config).filter(|id| *id != active);
+        Task::batch(neighbours.map(|id| self.panels.load(id).map(Message::Panel)))
+    }
+
+    /// Loads the first panel before there is a window, so that it opens complete
+    /// instead of empty. What takes too long goes on in the background.
+    fn prime(&mut self, load: Task<panels::Message>) -> Task<Message> {
+        /// Short enough to pass for the time it takes to start.
+        const HEAD_START: Duration = Duration::from_millis(250);
+
+        let Some(mut actions) = task::into_stream(load) else { return Task::none() };
+        let runtime = tokio::runtime::Handle::current();
+        let deadline = tokio::time::Instant::now() + HEAD_START;
+        let mut later = Vec::new();
+        loop {
+            let next =
+                runtime.block_on(async { tokio::time::timeout_at(deadline, actions.next()).await });
+            match next {
+                Ok(Some(Action::Output(message))) => {
+                    let effect = self.panels.update(message);
+                    later.push(self.settle(self.active, effect));
+                }
+                // Loading a panel has no business with the window.
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    let rest = actions.filter_map(async |action| match action {
+                        Action::Output(message) => Some(message),
+                        _ => None,
+                    });
+                    later.push(Task::run(rest, Message::Panel));
+                    break;
+                }
+            }
+        }
+        Task::batch(later)
+    }
+
+    /// Loads the other sections in the background, one after the other.
+    ///
+    /// Otherwise each would start empty when first opened and jump when its data
+    /// arrives. They are spread out so that no panel waits behind all the others.
+    fn preload(&self) -> Task<Message> {
+        const PAUSE: Duration = Duration::from_millis(300);
+        let sections = Section::ordered(&self.config).into_iter();
+        let others = sections.filter(|section| *section != self.active.section());
+        Task::batch(others.zip(1..).map(|(section, turn)| {
+            let panels = section.panels(&self.config);
+            let load = Task::batch(panels.map(|id| self.panels.load(id).map(Message::Panel)));
+            Task::future(tokio::time::sleep(PAUSE * turn)).discard().chain(load)
+        }))
     }
 
     fn open(&mut self, id: Id) -> Task<Message> {
@@ -163,12 +228,75 @@ impl App {
                 self.previewing = true;
             }
             Some(Request::ReloadThemes) => self.reload_themes(),
+            Some(Request::Run(session)) => tasks.push(self.start(panel, session)),
             Some(Request::Report(error)) => self.report(panel, error.to_string()),
             Some(Request::Done(text)) => {
                 self.receipt = Some(Receipt { text, state: Progress::Done, undo: None, panel });
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Runs a session in place of the panel that asked for it.
+    fn start(&mut self, panel: Id, session: Session) -> Task<Message> {
+        if self.job.as_ref().is_some_and(Job::is_running) {
+            self.report(panel, "Another package operation is still running".to_owned());
+            return Task::none();
+        }
+        // Home has too much else on it to give up its place.
+        let panel = if panel == Id::Home { Id::Updates } else { panel };
+        let (job, task) = Job::start(panel, session);
+        let text = job.command();
+        self.receipt = Some(Receipt { text, state: Progress::Running, undo: None, panel });
+        self.job = Some(job);
+        let open = if self.active == panel { Task::none() } else { self.open(panel) };
+        Task::batch([open, task.map(Message::Job)])
+    }
+
+    fn job(&mut self, message: job::Message) -> Task<Message> {
+        let Some(job) = &mut self.job else { return Task::none() };
+        let panel = job.panel;
+        let command = job.command();
+        let mut settle = |state: Progress| {
+            self.receipt = Some(Receipt { text: command.clone(), state, undo: None, panel });
+        };
+        let next = job.update(message);
+        let closing = job.closing.filter(|_| matches!(next, Next::Finished | Next::Stopped(_)));
+        match next {
+            Next::Nothing => return Task::none(),
+            Next::Finished => settle(Progress::Done),
+            Next::Failed(reason) => settle(Progress::Failed(reason)),
+            Next::Stopped(reason) => {
+                settle(Progress::Stopped(reason));
+                self.job = None;
+            }
+            Next::Close => {
+                self.job = None;
+                return Task::none();
+            }
+            Next::Retry(session) => return self.start(panel, session),
+            Next::Open(id) => return self.open(id),
+            Next::Run(cmd) => return self.run(panel, cmd.into(), None),
+        }
+        if let Some(window) = closing {
+            return window::close(window);
+        }
+        let mut reload = vec![self.panels.load(panel)];
+        if panel != Id::Updates {
+            reload.push(self.panels.load(Id::Updates));
+        }
+        Task::batch(reload).map(Message::Panel)
+    }
+
+    /// Closes the window, after a package operation if one is running.
+    fn close(&mut self, window: window::Id) -> Task<Message> {
+        let Some(job) = self.job.as_mut().filter(|job| job.is_running()) else {
+            return window::close(window);
+        };
+        let panel = job.panel;
+        job.closing = Some(window);
+        job.stop();
+        if self.active == panel { Task::none() } else { self.open(panel) }
     }
 
     fn report(&mut self, panel: Id, reason: String) {
@@ -222,6 +350,8 @@ impl App {
                 self.receipt = None;
                 Task::none()
             }
+            Message::Job(message) => self.job(message),
+            Message::CloseRequested(window) => self.close(window),
             Message::Key(event) => self.key(event),
             Message::Focused(focused) => {
                 self.focused = focused;
@@ -300,7 +430,15 @@ impl App {
                 .with(self.active)
                 .map(|(id, ())| Message::Refresh(id)),
         };
-        Subscription::batch([events, keys, themes, watch])
+        let panel = self.panels.events(self.active).map(Message::Panel);
+        let close = window::close_requests().map(Message::CloseRequested);
+        let tick = match &self.job {
+            Some(job) if job.is_running() => {
+                iced::time::every(Duration::from_secs(1)).map(|_| Message::Job(job::Message::Tick))
+            }
+            _ => Subscription::none(),
+        };
+        Subscription::batch([events, keys, themes, watch, panel, close, tick])
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -319,10 +457,24 @@ impl App {
         let ui =
             Ui { theme: &self.theme, config: &self.config, library: &self.library, width, content };
 
-        let mut page =
-            column![self.panels.view(self.active, ui).map(Message::Panel)].width(Fill).height(Fill);
+        let here = self.job.as_ref().filter(|job| job.panel == self.active);
+        let content = match here {
+            Some(job) => job.view(ui).map(Message::Job),
+            None => self.panels.view(self.active, ui).map(Message::Panel),
+        };
+        let mut page = column![content].width(Fill).height(Fill);
+        let elsewhere = self.job.as_ref().filter(|job| here.is_none() && job.is_running());
+        if let Some(job) = elsewhere {
+            page = page.push(self.reminder(ui, job));
+        }
+        // The reminder says the same and more.
+        let repeats = |receipt: &Receipt| {
+            elsewhere.is_some_and(|job| job.panel == receipt.panel)
+                && matches!(receipt.state, Progress::Running)
+        };
         if let Some(receipt) = &self.receipt
             && (self.config.receipt || matches!(receipt.state, Progress::Failed(_)))
+            && !repeats(receipt)
         {
             page = page.push(self.receipt(ui, receipt));
         }
@@ -383,7 +535,8 @@ impl App {
             let on = id == self.active;
             let tone = if on { Tone::Accent } else { Tone::Mute };
             let mut labels = column![ui.strong(id.title()).wrapping(Wrapping::None)].spacing(1);
-            let summary = self.panels.summary(id);
+            let job = self.job.as_ref().filter(|job| job.panel == id);
+            let summary = job.map_or_else(|| self.panels.summary(id), Job::summary);
             if !summary.is_empty() {
                 let tone = if on { Tone::Dim } else { Tone::Mute };
                 labels =
@@ -431,11 +584,27 @@ impl App {
         container(strip).style(style::sidebar).width(Fill).into()
     }
 
+    /// Keeps a package operation in sight while another panel is open.
+    fn reminder<'a>(&'a self, ui: Ui<'a>, job: &'a Job) -> Element<'a, Message> {
+        let tone = if job.asks() { Tone::Warning } else { Tone::Accent };
+        let content = row![
+            ui.sized_icon(Icon::Package, tone, 18.0),
+            ui.strong(job.summary()).width(Fill),
+            ui.button("Show", Kind::Link, Some(Message::Open(job.panel))),
+        ]
+        .spacing(14)
+        .align_y(Center);
+        let side = Ui::side_padding(ui.metrics(), ui.width);
+        let bar = container(content).padding([ui.d(4.0), side]).width(Fill).align_y(Center);
+        column![ui.divider(), bar].into()
+    }
+
     fn receipt<'a>(&'a self, ui: Ui<'a>, receipt: &'a Receipt) -> Element<'a, Message> {
         let (label, text, tone) = match &receipt.state {
             Progress::Running => ("Running", receipt.text.as_str(), Tone::Dim),
             Progress::Done => ("Last change", receipt.text.as_str(), Tone::Live),
             Progress::Failed(reason) => ("Not changed", reason.as_str(), Tone::Critical),
+            Progress::Stopped(reason) => ("Not changed", reason.as_str(), Tone::Dim),
         };
         // A command can be cut short, its start says enough. The end of an error
         // is often the part that matters, so errors get all the lines they need.
@@ -530,9 +699,7 @@ fn watch_command(command: &&'static [&'static str]) -> impl Stream<Item = ()> + 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced::futures::StreamExt;
     use iced_test::Simulator;
-    use iced_test::runtime::{Action, task};
 
     const SIZES: [(&str, Size); 3] = [
         ("wide", Size::new(1516.0, 800.0)),
@@ -551,6 +718,7 @@ mod tests {
             active: Id::Home,
             visited: Vec::new(),
             receipt: None,
+            job: None,
             focused: true,
             previewing: false,
         }
@@ -600,6 +768,57 @@ mod tests {
     }
 
     #[test]
+    fn switching_the_kind_of_services_does_not_move_the_switch() {
+        use panels::services::Message as Services;
+
+        let place = |app: &App, size: Size| {
+            let mut ui = simulate(app, size);
+            ["System", "Yours", "Running"].map(|label| ui.find(label).unwrap().bounds())
+        };
+        for (_, size) in SIZES {
+            let mut app = app();
+            app.active = Id::Services;
+            let known = Services::Loaded(sys::services::Scope::System, Ok(Vec::new()));
+            let _ = app.update(Message::Panel(panels::Message::Services(known)));
+            let before = place(&app, size);
+            // The other list has not been read yet, which is the worst case.
+            let switch = Services::Scope(sys::services::Scope::User);
+            let _ = app.update(Message::Panel(panels::Message::Services(switch)));
+            assert_eq!(before, place(&app, size));
+        }
+    }
+
+    #[test]
+    fn the_first_panel_is_complete_when_the_window_opens() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _context = runtime.enter();
+        let mut app = app();
+        app.active = Id::Mirrors;
+        assert!(simulate(&app, SIZES[1].1).find("Reading from the system").is_ok());
+        let _ = app.prime(app.panels.load(Id::Mirrors));
+        assert!(simulate(&app, SIZES[1].1).find("Reading from the system").is_err());
+    }
+
+    #[test]
+    fn a_slow_tool_does_not_keep_the_window_from_opening() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _context = runtime.enter();
+        let mut app = app();
+        app.active = Id::Updates;
+        let slow = Task::future(async {
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            panels::Message::Updates(panels::updates::Message::Loaded(Vec::new(), 0))
+        });
+        let started = std::time::Instant::now();
+        let rest = app.prime(slow);
+        assert!(started.elapsed() < Duration::from_millis(700));
+        assert!(simulate(&app, SIZES[1].1).find("Everything is up to date").is_err());
+        // It is not lost, only late.
+        runtime.block_on(drive(&mut app, rest));
+        assert!(simulate(&app, SIZES[1].1).find("Everything is up to date").is_ok());
+    }
+
+    #[test]
     fn undo_is_offered_once() {
         let mut app = app();
         let write = |value: &str| Op::from(sys::Cmd::new("true").arg(value));
@@ -618,6 +837,154 @@ mod tests {
         let _ = app.update(Message::Applied(Id::Power, Err(sys::Error::new("No permission"))));
         let mut ui = simulate(&app, SIZES[0].1);
         assert!(ui.find("No permission").is_ok());
+    }
+
+    /// Recordings of pacman, cut where the program waited or was busy.
+    fn stages() -> Vec<(&'static str, Job)> {
+        let upgrade = include_bytes!("sys/fixtures/upgrade.raw").as_slice();
+        let until = |mark: &str, share: f32| {
+            let start = upgrade.windows(mark.len()).position(|w| w == mark.as_bytes()).unwrap();
+            let start = start + mark.len();
+            start + ((upgrade.len() - start) as f32 * share) as usize
+        };
+        let job = |output: &[u8]| Job::recorded(Id::Updates, sys::packages::upgrade(), output);
+        let exit = |mut job: Job, code: i32| {
+            let event = sys::session::Event::Exited(Some(code));
+            let _ = job.update(job::Message::Event(event));
+            job
+        };
+        let question = b":: Synchronizing package databases...\r\n:: Replace \
+            pipewire-media-session with extra/wireplumber? [Y/n] ";
+        let provider = include_bytes!("sys/fixtures/provider.raw");
+        let choice = provider.windows(3).position(|w| w == b"1):").unwrap() + 3;
+        vec![
+            ("password", job(b"")),
+            ("preparing", job(b":: Synchronizing package databases...\r\n")),
+            ("question", job(question)),
+            ("choice", job(&provider[..choice])),
+            ("review", job(&upgrade[..until("Proceed with installation? [Y/n] ", 0.0)])),
+            ("downloading", job(&upgrade[..until("Retrieving packages...", 0.45)])),
+            ("checking", job(&upgrade[..until("checking package integrity", 0.0)])),
+            ("installing", job(&upgrade[..until("(3/4) upgrading bat", 0.0)])),
+            ("finishing", job(upgrade)),
+            ("done", exit(job(upgrade), 0)),
+            ("failed", exit(job(include_bytes!("sys/fixtures/unreachable.raw")), 1)),
+        ]
+    }
+
+    #[test]
+    fn every_stage_of_a_job_renders_at_every_size() {
+        let mut app = app();
+        app.active = Id::Updates;
+        for (_, job) in stages() {
+            app.job = Some(job);
+            for (_, size) in SIZES {
+                simulate(&app, size).snapshot(&app.theme).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_job_takes_the_place_of_its_panel_only() {
+        let mut app = app();
+        app.job = stages().into_iter().find(|(name, _)| *name == "review").map(|(_, job)| job);
+        app.active = Id::Updates;
+        assert!(simulate(&app, SIZES[1].1).find("Yes, install").is_ok());
+        app.active = Id::Mirrors;
+        let mut ui = simulate(&app, SIZES[1].1);
+        assert!(ui.find("Yes, install").is_err());
+        assert!(ui.find("Waiting for you").is_ok());
+    }
+
+    #[tokio::test]
+    async fn sessions_run_in_the_window() {
+        let script = "printf 'Packages (1) tree-2.2-1\\n\\n:: Processing package changes...\\n\
+            (1/1) installing tree [##] 100%%\\n'";
+        let session = |script: &str| {
+            Session::new(sys::Cmd::new("sh").args(["-c", script]), "Testing", "Tested")
+        };
+        let mut app = app();
+        let task = app.start(Id::Home, session(script));
+        // Home gives way to the panel that packages belong to.
+        assert_eq!(app.active, Id::Updates);
+        assert!(app.job.as_ref().unwrap().is_running());
+        let _ = app.start(Id::Firewall, session("true"));
+        let receipt = app.receipt.as_ref().unwrap();
+        assert!(matches!(&receipt.state, Progress::Failed(text) if text.contains("still running")));
+
+        drive(&mut app, task).await;
+        assert!(!app.job.as_ref().unwrap().is_running());
+        assert!(matches!(app.receipt.as_ref().unwrap().state, Progress::Done));
+        assert!(simulate(&app, SIZES[1].1).find("tree installed").is_ok());
+        let _ = app.update(Message::Job(job::Message::Close));
+        assert!(app.job.is_none());
+
+        let task = app.start(Id::Firewall, session("echo 'error: target not found: nope'; exit 1"));
+        drive(&mut app, task).await;
+        assert!(simulate(&app, SIZES[1].1).find("nope was not found").is_ok());
+    }
+
+    #[tokio::test]
+    async fn closing_the_window_waits_for_packages() {
+        let mut app = app();
+        let window = window::Id::unique();
+        let installing = b":: Processing package changes...\r\n(1/2) upgrading bat [#] 100%\r\n";
+        app.job = Some(Job::recorded(Id::Updates, sys::packages::upgrade(), installing));
+        let _ = app.update(Message::CloseRequested(window));
+        assert_eq!(app.active, Id::Updates);
+        assert!(app.job.as_ref().unwrap().is_running());
+        assert!(simulate(&app, SIZES[1].1).find("The window closes when this is done").is_ok());
+        let exit = job::Message::Event(sys::session::Event::Exited(Some(0)));
+        let mut actions = task::into_stream(app.update(Message::Job(exit))).unwrap();
+        let closed = matches!(
+            actions.next().await,
+            Some(Action::Window(iced_test::runtime::window::Action::Close(id))) if id == window
+        );
+        assert!(closed);
+    }
+
+    /// Opens no panel on an empty page once the background loading is through.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a running desktop"]
+    async fn preloading_fills_every_panel() {
+        let mut app = app();
+        let load = Task::batch([app.load_section(Id::Home), app.preload()]);
+        drive(&mut app, load).await;
+        for id in Id::ALL {
+            app.active = *id;
+            let loading = simulate(&app, SIZES[0].1).find("Reading from the system").is_ok();
+            assert!(!loading, "{} is still empty", id.key());
+        }
+    }
+
+    /// Renders the steps of a package operation from recordings.
+    ///
+    ///     SHOTS=target/shots cargo test job_shots -- --ignored
+    #[test]
+    #[ignore = "writes images"]
+    fn job_shots() {
+        let dir = PathBuf::from(std::env::var("SHOTS").unwrap_or("target/shots".into()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = app();
+        app.active = Id::Updates;
+        for (stage, job) in stages() {
+            app.receipt = Some(Receipt {
+                text: job.command(),
+                state: Progress::Running,
+                undo: None,
+                panel: Id::Updates,
+            });
+            app.job = Some(job);
+            for (name, size) in SIZES {
+                // An image that exists is compared with and not replaced.
+                for renderer in ["tiny-skia", "wgpu"] {
+                    let file = format!("job-{stage}-{name}-{renderer}.png");
+                    let _ = std::fs::remove_file(dir.join(file));
+                }
+                let snapshot = simulate(&app, size).snapshot(&app.theme).unwrap();
+                snapshot.matches_image(dir.join(format!("job-{stage}-{name}"))).unwrap();
+            }
+        }
     }
 
     /// Renders panels with data from the running system. Reads only.

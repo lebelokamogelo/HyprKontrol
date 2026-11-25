@@ -1,12 +1,17 @@
 //! pacman, CachyOS kernels, schedulers, mirrors and drivers.
 //!
-//! Anything that installs or removes packages opens in a terminal. pacman asks
-//! about conflicts, replacements and keys, and those questions are the user's to
+//! Anything that installs or removes packages is a [`Session`]. pacman asks about
+//! conflicts, replacements and keys, and those questions are the user's to
 //! answer; `--noconfirm` from a settings window would answer them blindly.
 
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
-use super::{Change, Cmd, query};
+use super::{Change, Cmd, Session, query};
+
+/// Where pacman keeps its databases.
+const DATABASE: &str = "/var/lib/pacman";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Update {
@@ -21,38 +26,96 @@ fn parse_updates(text: &str) -> Vec<Update> {
             let mut words = line.split_whitespace();
             let (name, from) = (words.next()?, words.next()?);
             (words.next()? == "->").then_some(())?;
+            // An update leaves out what pacman.conf says to ignore.
+            (!line.ends_with(']')).then_some(())?;
             Some(Update { name: name.into(), from: from.into(), to: words.next()?.into() })
         })
         .collect()
 }
 
-/// Updates known from the last database sync. Instant, but possibly stale.
+/// Updates known from the last check. Instant, but possibly stale.
 pub async fn cached_updates() -> Vec<Update> {
-    parse_updates(&query("pacman", ["-Qu"]).await.unwrap_or_default())
+    let database = latest_database().display().to_string();
+    let listing = query("pacman", ["-Qu", "--dbpath", &database]).await;
+    parse_updates(&listing.unwrap_or_default())
 }
 
 /// Updates on the mirrors right now. `checkupdates` syncs into a temporary
 /// database, which avoids leaving the system in a partially synced state.
 pub async fn fresh_updates() -> super::Result<Vec<Update>> {
-    match Cmd::new("checkupdates").output().await {
-        Ok(text) => Ok(parse_updates(&text)),
+    let updates = match Cmd::new("checkupdates").output().await {
+        Ok(text) => parse_updates(&text),
         // It exits with 2 and prints nothing when everything is current.
-        Err(error) if error.to_string().contains("failed (") => Ok(Vec::new()),
-        Err(error) => Err(error),
+        Err(error) if error.to_string().contains("failed (") => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    record_check();
+    Ok(updates)
+}
+
+/// Remembers that the mirrors have just been asked, whatever they had to offer.
+///
+/// Nothing else on disk says so: pacman leaves a database that is current as it
+/// is, and changes the directory around it even if it cannot be reached.
+pub fn record_check() {
+    // Trying out an update in a test is not a check.
+    if cfg!(test) {
+        return;
+    }
+    let path = check_record();
+    let made = path.parent().is_some_and(|dir| std::fs::create_dir_all(dir).is_ok());
+    // Without it, the time is a little too old, which is no reason to complain.
+    let _ = made.then(|| std::fs::write(path, ""));
+}
+
+fn check_record() -> PathBuf {
+    super::cache_dir().join("hyprkontrol/checked")
+}
+
+/// When the mirrors were last asked for updates, by this program or another.
+pub fn last_check() -> Option<SystemTime> {
+    let recorded = std::fs::metadata(check_record()).and_then(|file| file.modified()).ok();
+    let databases = [Some(PathBuf::from(DATABASE)), check_database()];
+    let synced = databases.iter().flatten().filter_map(|database| synced(database));
+    synced.chain(recorded).max()
+}
+
+/// The database that knows of the latest packages. That is the one of
+/// `checkupdates`, until the system is updated.
+fn latest_database() -> PathBuf {
+    let system = PathBuf::from(DATABASE);
+    match check_database() {
+        Some(check) if synced(&check) > synced(&system) => check,
+        _ => system,
     }
 }
 
-/// Date of the last `pacman -Sy`.
-pub fn last_sync() -> Option<std::time::SystemTime> {
-    std::fs::metadata("/var/lib/pacman/sync/cachyos.db")
-        .or_else(|_| std::fs::metadata("/var/lib/pacman/sync/core.db"))
+/// Where `checkupdates` keeps its database.
+fn check_database() -> Option<PathBuf> {
+    let user = std::fs::metadata("/proc/self").ok()?.uid();
+    let path = std::env::var_os("CHECKUPDATES_DB")
+        .map_or_else(|| std::env::temp_dir().join(format!("checkup-db-{user}")), PathBuf::from);
+    // By default it is in a place where anyone could create it.
+    let found = std::fs::symlink_metadata(&path).ok()?;
+    (found.is_dir() && found.uid() == user).then_some(path)
+}
+
+/// When `database` last received new data.
+///
+/// The files are dated by the server that built them. Their change time is the
+/// moment they were put in place here.
+fn synced(database: &Path) -> Option<SystemTime> {
+    std::fs::read_dir(database.join("sync"))
         .ok()?
-        .modified()
-        .ok()
+        .flatten()
+        .filter(|file| file.path().extension().is_some_and(|extension| extension == "db"))
+        .filter_map(|file| u64::try_from(file.metadata().ok()?.ctime()).ok())
+        .max()
+        .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
 }
 
 /// Describes how long ago `time` was, in words.
-pub fn ago(time: std::time::SystemTime) -> String {
+pub fn ago(time: SystemTime) -> String {
     let minutes = time.elapsed().map(|elapsed| elapsed.as_secs() / 60).unwrap_or(0);
     let plural = |n: u64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
     match minutes {
@@ -63,12 +126,29 @@ pub fn ago(time: std::time::SystemTime) -> String {
     }
 }
 
-pub fn upgrade() -> Cmd {
-    let helper = ["paru", "yay"].into_iter().find(|helper| super::installed(helper));
-    match helper {
-        Some(helper) => Cmd::terminal(format!("{helper} -Syu")),
-        None => Cmd::terminal("sudo pacman -Syu"),
-    }
+pub fn upgrade() -> Session {
+    let cmd = Cmd::new("pacman").arg("-Syu").root();
+    Session::new(cmd, "Updating the system", "System updated")
+}
+
+/// Number of installed packages that no repository provides.
+pub async fn foreign() -> usize {
+    query("pacman", ["-Qmq"]).await.map_or(0, |names| names.lines().count())
+}
+
+/// Updates packages from the AUR, in a terminal.
+///
+/// Their build scripts come from strangers and run as the user, so helpers show
+/// them in a pager or an editor first. That takes a real terminal.
+pub fn upgrade_aur() -> Option<Cmd> {
+    let helper = ["paru", "yay"].into_iter().find(|helper| super::installed(helper))?;
+    Some(Cmd::terminal(format!("{helper} -Sua")))
+}
+
+/// Whether an update has removed the modules of the kernel that is running.
+pub fn kernel_replaced() -> bool {
+    super::read("/proc/sys/kernel/osrelease")
+        .is_some_and(|release| !Path::new("/usr/lib/modules").join(release).is_dir())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,32 +243,37 @@ pub async fn kernels() -> Vec<Kernel> {
     parse_kernels(&query("pacman", ["-Sl"]).await.unwrap_or_default(), &running)
 }
 
-/// Package names end up in a shell command, so they are checked even though they
-/// come from pacman's own listing.
+/// A name that starts with a dash would be read as an option.
 fn valid_package(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
 }
 
-pub fn install(packages: &[&str]) -> Option<Cmd> {
+pub fn install(packages: &[&str]) -> Option<Session> {
+    let cmd = Cmd::new("pacman").arg("-S").args(packages.iter().copied()).root();
+    let names = packages.join(", ");
     packages
         .iter()
         .all(|package| valid_package(package))
-        .then(|| Cmd::terminal(format!("sudo pacman -S {}", packages.join(" "))))
+        .then(|| Session::new(cmd, format!("Installing {names}"), format!("{names} installed")))
 }
 
-pub fn remove(packages: &[&str]) -> Option<Cmd> {
+pub fn remove(packages: &[&str]) -> Option<Session> {
+    let cmd = Cmd::new("pacman").arg("-Rns").args(packages.iter().copied()).root();
+    let names = packages.join(", ");
     packages
         .iter()
         .all(|package| valid_package(package))
-        .then(|| Cmd::terminal(format!("sudo pacman -Rns {}", packages.join(" "))))
+        .then(|| Session::new(cmd, format!("Removing {names}"), format!("{names} removed")))
 }
 
 /// Kernels are installed with their headers, which DKMS modules need to build.
-pub fn install_kernel(package: &str) -> Option<Cmd> {
+pub fn install_kernel(package: &str) -> Option<Session> {
     install(&[package, &format!("{package}-headers")])
 }
 
-pub fn remove_kernel(package: &str) -> Option<Cmd> {
+pub fn remove_kernel(package: &str) -> Option<Session> {
     let headers = format!("{package}-headers");
     let has_headers = Path::new("/usr/src").join(package).exists();
     if has_headers { remove(&[package, &headers]) } else { remove(&[package]) }
@@ -292,7 +377,7 @@ pub fn set_scheduler(current: Option<&(String, String)>, target: Option<(&str, &
 pub struct MirrorList {
     pub label: &'static str,
     pub servers: Vec<String>,
-    pub ranked: Option<std::time::SystemTime>,
+    pub ranked: Option<SystemTime>,
 }
 
 pub fn mirrors() -> Vec<MirrorList> {
@@ -319,8 +404,9 @@ fn parse_mirrors(text: &str) -> Vec<String> {
     hosts
 }
 
-pub fn rank_mirrors() -> Cmd {
-    Cmd::terminal("sudo cachyos-rate-mirrors")
+pub fn rank_mirrors() -> Session {
+    let cmd = Cmd::new("cachyos-rate-mirrors").root();
+    Session::new(cmd, "Measuring the mirrors", "Mirrors ranked by speed").plain()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,12 +451,18 @@ pub async fn drivers() -> Vec<Driver> {
     parse_drivers(&available.unwrap_or_default(), &installed.unwrap_or_default())
 }
 
-pub fn install_driver(profile: &str) -> Option<Cmd> {
-    valid_package(profile).then(|| Cmd::terminal(format!("sudo chwd --install {profile}")))
+pub fn install_driver(profile: &str) -> Option<Session> {
+    driver("--install", profile, "Installing", "installed")
 }
 
-pub fn remove_driver(profile: &str) -> Option<Cmd> {
-    valid_package(profile).then(|| Cmd::terminal(format!("sudo chwd --remove {profile}")))
+pub fn remove_driver(profile: &str) -> Option<Session> {
+    driver("--remove", profile, "Removing", "removed")
+}
+
+fn driver(option: &str, profile: &str, doing: &str, done: &str) -> Option<Session> {
+    let cmd = Cmd::new("chwd").args([option, profile]).root();
+    valid_package(profile)
+        .then(|| Session::new(cmd, format!("{doing} {profile}"), format!("{profile} {done}")))
 }
 
 #[cfg(test)]
@@ -382,6 +474,34 @@ mod tests {
         let updates = parse_updates("linux-cachyos 7.3.5-2 -> 7.3.6-1\nwarning: something\n");
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].to, "7.3.6-1");
+    }
+
+    #[test]
+    fn ignored_packages_are_not_updates() {
+        let text = "bat 0.25-1 -> 0.26-1\nlinux-cachyos 7.3.5-2 -> 7.3.6-1 [ignored]\n";
+        let names: Vec<_> = parse_updates(text).into_iter().map(|update| update.name).collect();
+        assert_eq!(names, ["bat"]);
+    }
+
+    #[test]
+    fn a_sync_is_dated_by_when_it_arrived() {
+        let dir = std::env::temp_dir().join(format!("hyprkontrol-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(synced(&dir), None);
+        std::fs::create_dir_all(dir.join("sync")).unwrap();
+        assert_eq!(synced(&dir), None);
+
+        // pacman dates the file like the server does, here a year ago.
+        let file = std::fs::File::create(dir.join("sync/core.db")).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(31_536_000)).unwrap();
+        let age = synced(&dir).unwrap().elapsed().unwrap_or_default();
+        assert!(age < Duration::from_secs(60), "{age:?}");
+
+        // A sync that fails leaves only traces around the databases.
+        std::fs::remove_file(dir.join("sync/core.db")).unwrap();
+        std::fs::write(dir.join("sync/core.db.part"), "").unwrap();
+        assert_eq!(synced(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -402,10 +522,21 @@ mod tests {
     }
 
     #[test]
-    fn package_names_cannot_inject_shell() {
-        assert!(install(&["linux-cachyos"]).is_some());
+    fn package_names_cannot_inject_options() {
+        let session = install(&["linux-cachyos", "linux-cachyos-headers"]).unwrap();
+        assert_eq!(session.cmd.to_string(), "pkexec pacman -S linux-cachyos linux-cachyos-headers");
         assert!(install(&["x; rm -rf ~"]).is_none());
+        assert!(install(&["--noconfirm"]).is_none());
+        assert!(remove(&["--cascade"]).is_none());
         assert!(install_driver("$(id)").is_none());
+    }
+
+    #[test]
+    fn nothing_is_confirmed_on_the_users_behalf() {
+        let sessions = [Some(upgrade()), install(&["ufw"]), remove(&["ufw"])];
+        for session in sessions.into_iter().flatten() {
+            assert!(!session.cmd.to_string().contains("--noconfirm"));
+        }
     }
 
     #[test]

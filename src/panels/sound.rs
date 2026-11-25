@@ -1,9 +1,12 @@
-use iced::widget::{column, row};
-use iced::{Center, Task};
+use std::time::Instant;
 
-use super::{Effect, Panel, Watch, quietly};
+use iced::widget::{column, row};
+use iced::{Center, Subscription, Task};
+
+use super::{Effect, Panel, SETTLE, follow, quietly};
 use crate::icon::Icon;
 use crate::sys::audio::{self, Audio, Device, Direction, Stream};
+use crate::sys::levels::Source;
 use crate::sys::{Change, Cmd, Result};
 use crate::theme::Tone;
 use crate::ui::{Element, Throttle, Ui};
@@ -30,11 +33,17 @@ pub struct State {
     /// The slider being dragged, its value, and the value before the drag.
     dragging: Option<(Target, f32, f32)>,
     throttle: Throttle<(Target, f32)>,
+    /// Reads because of a change, one at a time.
+    reads: Throttle<()>,
+    /// When a slider was last let go.
+    released: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Box<Result<Audio>>),
+    Changed,
+    Heard(Box<Result<Audio>>),
     Drag(Target, f32, f32),
     Release,
     Sent,
@@ -59,6 +68,27 @@ impl std::fmt::Display for Profile {
 impl State {
     fn audio(&self) -> Option<&Audio> {
         self.audio.as_ref()?.as_ref().ok()
+    }
+
+    /// Keeps a slider where it was let go until the system reports it there.
+    fn store(&mut self, target: &Target, percent: f32) {
+        let Some(Ok(audio)) = &mut self.audio else { return };
+        match target {
+            Target::Device(direction, name) => {
+                let devices = match direction {
+                    Direction::Output => &mut audio.outputs,
+                    Direction::Input => &mut audio.inputs,
+                };
+                for device in devices.iter_mut().filter(|device| device.name == *name) {
+                    device.volume = percent;
+                }
+            }
+            Target::Stream(index) => {
+                for stream in audio.streams.iter_mut().filter(|stream| stream.index == *index) {
+                    stream.volume = percent;
+                }
+            }
+        }
     }
 
     /// The value to draw: the drag position while dragging, else the real one.
@@ -192,6 +222,19 @@ impl Panel for State {
                 self.audio = Some(*audio);
                 Effect::none()
             }
+            Message::Changed => match self.reads.push(()) {
+                Some(()) => Effect::task(read()),
+                None => Effect::none(),
+            },
+            Message::Heard(audio) => {
+                if self.released.is_none_or(|at| at.elapsed() > SETTLE) {
+                    self.audio = Some(*audio);
+                }
+                match self.reads.done() {
+                    Some(()) => Effect::task(read()),
+                    None => Effect::none(),
+                }
+            }
             Message::Drag(target, value, actual) => {
                 let before = match &self.dragging {
                     Some((dragged, _, before)) if *dragged == target => *before,
@@ -214,9 +257,13 @@ impl Panel for State {
             Message::Release => {
                 self.throttle.clear();
                 match self.dragging.take() {
-                    Some((target, value, before)) => Effect::change(
-                        Change::new(target.command(value)).undo(target.command(before)),
-                    ),
+                    Some((target, value, before)) => {
+                        self.store(&target, value);
+                        self.released = Some(Instant::now());
+                        Effect::change(
+                            Change::new(target.command(value)).undo(target.command(before)),
+                        )
+                    }
                     None => Effect::none(),
                 }
             }
@@ -269,7 +316,11 @@ impl Panel for State {
         }
     }
 
-    fn watch(&self) -> Watch {
-        Watch::Command(&["pactl", "subscribe"])
+    fn events(&self) -> Subscription<Message> {
+        follow(Source::Volume).map(|()| Message::Changed)
     }
+}
+
+fn read() -> Task<Message> {
+    Task::perform(audio::load(), |audio| Message::Heard(Box::new(audio)))
 }

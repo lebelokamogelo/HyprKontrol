@@ -1,19 +1,24 @@
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use iced::widget::{button, column, container, row, space};
-use iced::{Center, Fill, Length, Task};
+use iced::{Center, Fill, Length, Subscription, Task};
 
-use super::{Effect, Id, Panel, Request, Section, Watch, quietly};
+use super::{Effect, Id, Panel, Request, SETTLE, Section, Watch, follow, quietly};
 use crate::icon::Icon;
+use crate::sys::levels::Source;
 use crate::sys::{self, audio, desktop, network, packages, power, probe, services, storage};
 use crate::theme::style::{self, Tone};
 use crate::ui::{Element, Throttle, Ui, chart};
 
 /// Number of samples on the clock chart, one per second.
 const HISTORY: usize = 40;
-/// Everything else on this panel changes slowly and is read less often.
+/// What announces its changes is followed. The rest of this panel changes slowly
+/// and is read less often.
 const REFRESH: u32 = 10;
+/// A snapshot takes a while to gather. Levels read more recently than this are
+/// newer than the ones in it.
+const FRESH: Duration = Duration::from_secs(3);
 
 /// A quick control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,8 +115,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
     root: Option<storage::Volume>,
-    updates: usize,
-    last_sync: Option<String>,
+    last_check: Option<SystemTime>,
     machine: probe::Machine,
     topology: probe::Topology,
 }
@@ -156,13 +160,11 @@ async fn snapshot() -> Snapshot {
 }
 
 async fn facts() -> Facts {
-    let (disks, updates, machine) =
-        tokio::join!(storage::disks(), packages::cached_updates(), probe::machine());
+    let disks = storage::disks().await;
     Facts {
         root: disks.ok().and_then(|disks| storage::root(&disks).cloned()),
-        updates: updates.len(),
-        last_sync: packages::last_sync().map(packages::ago),
-        machine,
+        last_check: packages::last_check(),
+        machine: probe::identity(),
         topology: probe::topology(),
     }
 }
@@ -186,6 +188,8 @@ pub enum Level {
 pub struct State {
     snapshot: Option<Snapshot>,
     facts: Option<Facts>,
+    /// Known last, since pacman has to read every database for it.
+    updates: Option<usize>,
     sample: probe::Sample,
     load: f32,
     clock: VecDeque<f32>,
@@ -194,12 +198,20 @@ pub struct State {
     query: String,
     dragging: Option<(Level, f32)>,
     throttle: Throttle<(Level, f32)>,
+    /// Reads of the volume and of the brightness, one of each at a time.
+    hearing: Throttle<()>,
+    seeing: Throttle<()>,
+    /// When a level was last read because it had changed.
+    followed: Option<Instant>,
+    /// When a slider of this panel was last let go.
+    released: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Box<Snapshot>),
     Facts(Box<Facts>),
+    Updates(usize),
     Sampled(Box<(probe::Sample, Option<power::Battery>)>),
     Search(String),
     Open(Id),
@@ -208,12 +220,28 @@ pub enum Message {
     Drag(Level, f32),
     Release(Level),
     Sent,
+    Changed(Source),
+    Heard(Box<sys::Result<audio::Audio>>),
+    Seen(Option<f32>),
 }
 
 /// The search field, focused by the application on Ctrl+K.
 pub const SEARCH: &str = "home-search";
 
+/// Reads only what has changed, which is what makes it quick.
+fn read(source: Source) -> Task<Message> {
+    match source {
+        Source::Volume => Task::perform(audio::load(), |audio| Message::Heard(Box::new(audio))),
+        Source::Brightness => Task::perform(power::brightness(), Message::Seen),
+    }
+}
+
 impl State {
+    /// Whether the sliders here are at rest, so that what is read can be shown.
+    fn settled(&self) -> bool {
+        self.dragging.is_none() && self.released.is_none_or(|at| at.elapsed() > SETTLE)
+    }
+
     fn command(&self, level: Level, percent: f32) -> Option<sys::Cmd> {
         let audio = self.snapshot.as_ref()?.audio.as_ref();
         match level {
@@ -280,7 +308,7 @@ impl State {
                 Some(false) => Effect::run(
                     sys::Cmd::new("hyprsunset").args(["--temperature", "4500"]).detached(),
                 ),
-                None => Effect::checked(packages::install(&["hyprsunset"])),
+                None => Effect::session(packages::install(&["hyprsunset"])),
             },
             Tile::KeepAwake => {
                 Effect::change(services::set_active(
@@ -409,8 +437,10 @@ impl State {
         {
             let cycles =
                 battery.cycles.map_or(String::new(), |cycles| format!("{cycles} charge cycles"));
-            rows.push(ui.alert(
+            // Wear does not go away, so a dot here would never clear.
+            rows.push(ui.link(
                 Icon::BatteryHealth,
+                Tone::Mute,
                 format!("Battery holds {:.0}% of its original charge", battery.health() * 100.0),
                 cycles,
                 Message::Open(Id::Power),
@@ -434,23 +464,17 @@ impl State {
                 Message::Open(Id::Firewall),
             ));
         }
-        let synced = facts.last_sync.as_deref().unwrap_or("an unknown time ago");
-        rows.push(match facts.updates {
-            0 => ui.link(
-                Icon::Package,
-                Tone::Mute,
-                "Packages are up to date",
-                format!("Last checked {synced}"),
-                Message::Open(Id::Updates),
-            ),
-            count => ui.link(
-                Icon::Package,
-                Tone::Accent,
-                format!("{count} {} to install", if count == 1 { "update" } else { "updates" }),
-                format!("Last checked {synced}"),
-                Message::Open(Id::Updates),
-            ),
-        });
+        let checked =
+            facts.last_check.map_or_else(|| "an unknown time ago".to_owned(), packages::ago);
+        // The row is there from the start, so that nothing moves once it is known.
+        let (tone, label) = match self.updates {
+            None => (Tone::Mute, "Packages".to_owned()),
+            Some(0) => (Tone::Mute, "Packages are up to date".to_owned()),
+            Some(1) => (Tone::Accent, "1 update to install".to_owned()),
+            Some(count) => (Tone::Accent, format!("{count} updates to install")),
+        };
+        let hint = format!("Last checked {checked}");
+        rows.push(ui.link(Icon::Package, tone, label, hint, Message::Open(Id::Updates)));
         if snapshot.scheduler.running.is_none() && !snapshot.scheduler.available.is_empty() {
             rows.push(ui.link(
                 Icon::Chip,
@@ -538,12 +562,59 @@ impl Panel for State {
 
     fn update(&mut self, message: Message) -> Effect<Message> {
         match message {
-            Message::Loaded(snapshot) => {
+            Message::Loaded(mut snapshot) => {
+                if let Some(known) = &mut self.snapshot
+                    && self.followed.is_some_and(|at| at.elapsed() < FRESH)
+                {
+                    snapshot.audio = known.audio.take();
+                    snapshot.brightness = known.brightness;
+                }
                 self.snapshot = Some(*snapshot);
                 Effect::none()
             }
+            Message::Changed(source) => {
+                let reads = match source {
+                    Source::Volume => &mut self.hearing,
+                    Source::Brightness => &mut self.seeing,
+                };
+                match reads.push(()) {
+                    Some(()) => Effect::task(read(source)),
+                    None => Effect::none(),
+                }
+            }
+            Message::Heard(heard) => {
+                if self.settled()
+                    && let (Some(snapshot), Ok(heard)) = (&mut self.snapshot, *heard)
+                {
+                    snapshot.audio = Some(heard);
+                    self.followed = Some(Instant::now());
+                }
+                match self.hearing.done() {
+                    Some(()) => Effect::task(read(Source::Volume)),
+                    None => Effect::none(),
+                }
+            }
+            Message::Seen(seen) => {
+                if self.settled()
+                    && let (Some(snapshot), Some(seen)) = (&mut self.snapshot, seen)
+                {
+                    snapshot.brightness = Some(seen);
+                    self.followed = Some(Instant::now());
+                }
+                match self.seeing.done() {
+                    Some(()) => Effect::task(read(Source::Brightness)),
+                    None => Effect::none(),
+                }
+            }
             Message::Facts(facts) => {
                 self.facts = Some(*facts);
+                // Takes far longer than everything else here, which is not to
+                // wait for it.
+                let updates = packages::cached_updates();
+                Effect::task(Task::perform(updates, |list| Message::Updates(list.len())))
+            }
+            Message::Updates(count) => {
+                self.updates = Some(count);
                 Effect::none()
             }
             Message::Sampled(reading) => {
@@ -596,6 +667,7 @@ impl Panel for State {
             Message::Release(level) => {
                 let Some((_, percent)) = self.dragging else { return Effect::none() };
                 self.throttle.clear();
+                self.released = Some(Instant::now());
                 let apply = self.command(level, percent);
                 // The snapshot still holds the value from before the drag.
                 self.dragging = None;
@@ -693,6 +765,13 @@ impl Panel for State {
     fn watch(&self) -> Watch {
         Watch::Every(Duration::from_secs(1))
     }
+
+    fn events(&self) -> Subscription<Message> {
+        Subscription::batch([
+            follow(Source::Volume).map(|()| Message::Changed(Source::Volume)),
+            follow(Source::Brightness).map(|()| Message::Changed(Source::Brightness)),
+        ])
+    }
 }
 
 impl Snapshot {
@@ -771,4 +850,76 @@ pub fn gauge<'a, M: 'a>(ui: Ui<'a>, battery: &power::Battery) -> Element<'a, M> 
     };
     let gauge = chart::Gauge { now: battery.now, full: battery.full, design: battery.design };
     column![gauge.view(), scale].spacing(8).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn speaker(volume: f32) -> audio::Audio {
+        let device = audio::Device {
+            name: "speaker".to_owned(),
+            label: "Speaker".to_owned(),
+            volume,
+            muted: false,
+            default: true,
+            headphones: false,
+        };
+        audio::Audio { outputs: vec![device], ..audio::Audio::default() }
+    }
+
+    fn state() -> State {
+        let audio = Some(speaker(40.0));
+        let snapshot = Snapshot { audio, brightness: Some(50.0), ..Snapshot::default() };
+        State { snapshot: Some(snapshot), ..State::default() }
+    }
+
+    fn heard(volume: f32) -> Message {
+        Message::Heard(Box::new(Ok(speaker(volume))))
+    }
+
+    #[test]
+    fn levels_follow_the_keys() {
+        let mut state = state();
+        let _ = state.update(Message::Changed(Source::Volume));
+        let _ = state.update(heard(45.0));
+        let _ = state.update(Message::Seen(Some(60.0)));
+        assert_eq!(state.level(Level::Speaker), Some(45.0));
+        assert_eq!(state.level(Level::Brightness), Some(60.0));
+        // A reading that did not work out changes nothing.
+        let _ = state.update(Message::Seen(None));
+        assert_eq!(state.level(Level::Brightness), Some(60.0));
+    }
+
+    #[test]
+    fn a_held_key_is_read_one_at_a_time_and_to_the_end() {
+        let mut state = state();
+        assert_eq!(state.hearing.push(()), Some(()));
+        let _ = state.update(Message::Changed(Source::Volume));
+        let _ = state.update(Message::Changed(Source::Volume));
+        let _ = state.update(heard(45.0));
+        // Another read is under way for what changed in the meantime, then none.
+        assert_eq!(state.hearing.done(), None);
+    }
+
+    #[test]
+    fn a_snapshot_does_not_bring_back_an_older_level() {
+        let mut state = state();
+        let older = state.snapshot.clone().unwrap();
+        let _ = state.update(heard(45.0));
+        let _ = state.update(Message::Loaded(Box::new(older)));
+        assert_eq!(state.level(Level::Speaker), Some(45.0));
+    }
+
+    #[test]
+    fn sliders_in_use_are_left_alone() {
+        let mut state = state();
+        let _ = state.update(Message::Drag(Level::Speaker, 70.0));
+        let _ = state.update(heard(62.0));
+        assert_eq!(state.level(Level::Speaker), Some(70.0));
+        // Read before the final value was applied, but reported after.
+        let _ = state.update(Message::Release(Level::Speaker));
+        let _ = state.update(heard(62.0));
+        assert_eq!(state.level(Level::Speaker), Some(70.0));
+    }
 }

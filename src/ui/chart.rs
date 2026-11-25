@@ -11,16 +11,25 @@ use crate::theme::style::{self, Tone};
 
 /// A thin horizontal bar.
 pub fn bar<'a, M: 'a>(fraction: f32, tone: Tone) -> Element<'a, M> {
+    filled(fraction, tone, 8.0)
+}
+
+/// A bar that underlines a row of a list.
+pub fn line<'a, M: 'a>(fraction: f32, tone: Tone) -> Element<'a, M> {
+    filled(fraction, tone, 4.0)
+}
+
+fn filled<'a, M: 'a>(fraction: f32, tone: Tone, height: f32) -> Element<'a, M> {
     // Portions are integers, hence the fixed-point resolution.
     let filled = (fraction.clamp(0.0, 1.0) * 1000.0).round() as u16;
     let fill = container(space())
-        .height(8)
+        .height(height)
         .width(Length::FillPortion(filled.max(1)))
         .style(style::meter(Some(tone)));
     let rest = space().width(Length::FillPortion((1000 - filled).max(1)));
     let content: Element<'a, M> =
         if filled == 0 { space().into() } else { row![fill, rest].into() };
-    container(content).height(8).width(Fill).clip(true).style(style::meter(None)).into()
+    container(content).height(height).width(Fill).clip(true).style(style::meter(None)).into()
 }
 
 /// Recent values as an area, newest on the right.
@@ -187,6 +196,71 @@ impl<M> canvas::Program<M, Theme> for Gauge {
                 ),
                 c.accent,
             );
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Progress through parts of different weight, such as the files of a download.
+pub struct Parts {
+    /// Weight of each part and how much of it is done.
+    pub parts: Vec<(f32, f32)>,
+}
+
+impl Parts {
+    pub fn view<'a, M: 'a>(self) -> Element<'a, M> {
+        Canvas::new(self).width(Fill).height(54).into()
+    }
+}
+
+impl<M> canvas::Program<M, Theme> for Parts {
+    type State = ();
+
+    fn draw(
+        &self,
+        (): &(),
+        renderer: &Renderer,
+        theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        const GAP: f32 = 3.0;
+        /// Below this, the gaps would say more than the parts.
+        const NARROWEST: f32 = 12.0;
+
+        let c = theme.colors();
+        let mut frame = Frame::new(renderer, bounds.size());
+        let (width, height) = (bounds.width, bounds.height);
+        let radius = theme.metrics().control_radius.min(height / 2.0);
+
+        let total = self.parts.iter().map(|(weight, _)| weight).sum::<f32>().max(f32::EPSILON);
+        let done = self.parts.iter().map(|(weight, done)| weight * done).sum::<f32>();
+        let crowded = width < NARROWEST * self.parts.len() as f32;
+        let merged = [(1.0, done / total)];
+        let (parts, total) =
+            if crowded { (merged.as_slice(), 1.0) } else { (self.parts.as_slice(), total) };
+
+        let last = parts.len().saturating_sub(1);
+        let free = width - GAP * last as f32;
+        let mut x = 0.0;
+        for (index, (weight, fraction)) in parts.iter().enumerate() {
+            let part = free * weight / total;
+            let left = if index == 0 { radius } else { 0.0 };
+            let right = if index == last { radius } else { 0.0 };
+            let mut fill = |width: f32, color: Color| {
+                // A sliver cannot carry a full corner.
+                let left = left.min(width);
+                let right = if width >= part - 0.5 { right } else { 0.0 };
+                let corners = border::Radius::default().left(left).right(right);
+                let size = Size::new(width, height);
+                frame.fill(&Path::rounded_rectangle(Point::new(x, 0.0), size, corners), color);
+            };
+            fill(part, c.track);
+            let filled = part * fraction.clamp(0.0, 1.0);
+            if filled > 0.5 {
+                fill(filled, c.accent);
+            }
+            x += part + GAP;
         }
         vec![frame.into_geometry()]
     }

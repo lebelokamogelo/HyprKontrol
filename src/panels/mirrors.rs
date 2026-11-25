@@ -31,7 +31,7 @@ impl Panel for State {
                 self.lists = Some(lists);
                 Effect::none()
             }
-            Message::Rank => Effect::run(packages::rank_mirrors()),
+            Message::Rank => Effect::session(Some(packages::rank_mirrors())),
         }
     }
 

@@ -6,6 +6,7 @@ src/
 ├── app.rs       Navigation, receipt bar, theme, subscriptions
 ├── config.rs    Preferences
 ├── icon.rs      Embedded icons
+├── job.rs       A package operation in progress
 ├── panels/      One module per panel
 ├── sys/         One module per subsystem, no UI
 ├── theme/       Theme format, library, widget styles
@@ -32,14 +33,41 @@ An operation (`sys::Op`) is one of five things: commands, Hyprland edits, a file
 write, joining a network, or importing a VPN profile. Keeping it as data is what makes the receipt and
 Undo possible.
 
+## Package operations
+
+pacman draws progress and asks questions only on a terminal, so it is given one.
+
+1. A panel asks for a `Session`, which is a command with words for what it does.
+2. The application starts a `Job` and shows it in place of that panel.
+3. `sys::session` runs the command in a pseudo-terminal.
+4. `sys::screen` follows the cursor, and `sys::pacman` reads the lines.
+5. Answers are written back as if they had been typed.
+
+There is one job at a time, since pacman locks its database. It carries on while
+other panels are open, and a window that is closed while packages are being
+changed waits for it.
+
+Nothing depends on recognising everything. Lines that mean nothing to
+`sys::pacman` still appear in the output, and a question it does not know can be
+answered by typing. Its tests replay recordings of pacman from
+`sys/fixtures`.
+
 ## Reading
 
 `Panel::load` returns a task that reads everything the panel shows. It runs when
-the panel opens, after every change, and when the window regains focus.
+the panel opens, after every change, and when the window regains focus. The first
+panel is loaded before the window opens, for a quarter of a second at most. All
+others are loaded once in the background after the start. Either way, panels do
+not open empty. A reading that takes long should be a task of its own, so that
+nothing waits for it.
 
 `Panel::watch` says what keeps an open panel current: nothing, a timer, or a
 command that prints a line when something happens. Prefer the command. Watching
 stops when the window loses focus.
+
+`Panel::events` is for what has to be followed as it happens, such as the volume.
+It carries on without focus, so it must wait for events and not poll.
+`sys::levels` watches volume and brightness this way.
 
 ## Hyprland
 
@@ -122,12 +150,18 @@ make check
 ```
 
 Panels are rendered without a window, at three widths, as part of the normal
-tests. Four further tests need real hardware or a running desktop and are ignored by
-default:
+tests, and so is every step of a package operation. These are ignored by default,
+because they need real hardware or a running desktop, or write images:
 
 ```sh
 # Render panels with live data. Reads only.
 SHOTS=target/shots cargo test screenshots -- --ignored
+
+# Render the steps of a package operation from recordings.
+SHOTS=target/shots cargo test job_shots -- --ignored
+
+# Check that loading in the background fills every panel. Reads only.
+cargo test preloading -- --ignored
 
 # Import a VPN profile and remove it. Use a throwaway file.
 VPN_PROFILE=/path/to/test.ovpn cargo test imports_a_vendor_profile -- --ignored

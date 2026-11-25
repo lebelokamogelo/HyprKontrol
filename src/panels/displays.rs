@@ -1,11 +1,11 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use iced::Task;
 use iced::widget::{column, row};
-use iced::{Center, Fill, Rectangle};
+use iced::{Center, Fill, Rectangle, Subscription, Task};
 
-use super::{Effect, Panel, Watch, quietly};
+use super::{Effect, Panel, SETTLE, Watch, follow, quietly};
 use crate::sys::hypr::{self, Edit, Rule};
+use crate::sys::levels::Source;
 use crate::sys::monitor::{self, Mode, Monitor};
 use crate::sys::{Op, Result, power};
 use crate::ui::{Element, Kind, Throttle, Ui, chart};
@@ -21,6 +21,10 @@ pub struct State {
     brightness: Option<f32>,
     brightness_before: Option<f32>,
     throttle: Throttle<f32>,
+    /// Reads because of a change, one at a time.
+    reads: Throttle<()>,
+    /// When the slider was last let go.
+    released: Option<Instant>,
     /// Rule to go back to, the rule on trial, and the seconds left to keep it.
     trial: Option<(Rule, Rule, u8)>,
 }
@@ -43,6 +47,8 @@ pub enum Message {
     Brightness(f32),
     BrightnessDone,
     Sent,
+    Changed,
+    Seen(Option<f32>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -283,8 +289,23 @@ impl Panel for State {
                 Some(value) => Effect::task(quietly(power::set_brightness(value), Message::Sent)),
                 None => Effect::none(),
             },
+            Message::Changed => match self.reads.push(()) {
+                Some(()) => Effect::task(read()),
+                None => Effect::none(),
+            },
+            Message::Seen(seen) => {
+                let settled = self.released.is_none_or(|at| at.elapsed() > SETTLE);
+                if seen.is_some() && settled && self.brightness_before.is_none() {
+                    self.brightness = seen;
+                }
+                match self.reads.done() {
+                    Some(()) => Effect::task(read()),
+                    None => Effect::none(),
+                }
+            }
             Message::BrightnessDone => {
                 self.throttle.clear();
+                self.released = Some(Instant::now());
                 match (self.brightness_before.take(), self.brightness) {
                     (Some(before), Some(after)) => Effect::change(
                         crate::sys::Change::new(power::set_brightness(after))
@@ -334,6 +355,14 @@ impl Panel for State {
     fn watch(&self) -> Watch {
         Watch::Every(Duration::from_secs(4))
     }
+
+    fn events(&self) -> Subscription<Message> {
+        follow(Source::Brightness).map(|()| Message::Changed)
+    }
+}
+
+fn read() -> Task<Message> {
+    Task::perform(power::brightness(), Message::Seen)
 }
 
 fn tick() -> Task<Message> {

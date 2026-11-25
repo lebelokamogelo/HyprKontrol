@@ -82,7 +82,7 @@ impl Panel for State {
                 self.data = Some(data);
                 Effect::none()
             }
-            Message::Install => Effect::checked(packages::install(&["cups", "cups-pdf"])),
+            Message::Install => Effect::session(packages::install(&["cups", "cups-pdf"])),
             Message::Service(on) => Effect::change(services::set_now(Scope::System, SOCKET, on)),
             Message::Default(name) => {
                 let set = |name: &str| Cmd::new("lpoptions").args(["-d", name]);
@@ -103,7 +103,7 @@ impl Panel for State {
             Some(data) if !data.installed => vec![ui.empty(
                 Icon::Printer,
                 "Printing is not set up",
-                "CUPS is the print service used on Linux. Installing it opens a terminal.",
+                "CUPS is the print service used on Linux.",
                 Some(ui.button("Install CUPS", Kind::Primary, Some(Message::Install))),
             )],
             Some(data) => {

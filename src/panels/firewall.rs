@@ -83,7 +83,7 @@ impl Panel for State {
                 }))
             }
             Message::Delete(rule) => Effect::change(ufw::delete(&rule)),
-            Message::Install => Effect::checked(packages::install(&["ufw"])),
+            Message::Install => Effect::session(packages::install(&["ufw"])),
         }
     }
 

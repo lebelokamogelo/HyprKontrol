@@ -96,7 +96,7 @@ impl Panel for State {
             Message::Test => Effect::run(
                 Cmd::new("notify-send").args(["HyprKontrol", "This is a test notification"]),
             ),
-            Message::Install => Effect::checked(packages::install(&["swaync"])),
+            Message::Install => Effect::session(packages::install(&["swaync"])),
         }
     }
 

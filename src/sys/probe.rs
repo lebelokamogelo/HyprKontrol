@@ -146,6 +146,17 @@ pub struct Machine {
 
 pub async fn machine() -> Machine {
     let (lspci, hyprland) = tokio::join!(query("lspci", []), query("hyprctl", ["version"]));
+    Machine {
+        gpus: lspci.as_deref().map(parse_gpus).unwrap_or_default(),
+        desktop: hyprland
+            .and_then(|text| text.split_whitespace().nth(1).map(|v| format!("Hyprland {v}")))
+            .unwrap_or_default(),
+        ..identity()
+    }
+}
+
+/// The part that only takes reading a few files.
+pub fn identity() -> Machine {
     let cpuinfo = read("/proc/cpuinfo").unwrap_or_default();
     let dmi = |name: &str| read(format!("/sys/class/dmi/id/{name}")).unwrap_or_default();
     Machine {
@@ -162,12 +173,9 @@ pub async fn machine() -> Machine {
             .map(|value| short_cpu(value.trim_start_matches([' ', '\t', ':'])))
             .unwrap_or_default(),
         threads: cpu_dirs().len(),
-        gpus: lspci.as_deref().map(parse_gpus).unwrap_or_default(),
         memory: memory_field(&read("/proc/meminfo").unwrap_or_default(), "MemTotal"),
-        desktop: hyprland
-            .and_then(|text| text.split_whitespace().nth(1).map(|v| format!("Hyprland {v}")))
-            .unwrap_or_default(),
         uptime: uptime(),
+        ..Machine::default()
     }
 }
 

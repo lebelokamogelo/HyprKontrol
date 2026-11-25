@@ -752,6 +752,18 @@ impl<'a> Ui<'a> {
         container(content).padding([40, 20]).center_x(Fill).style(style::card).into()
     }
 
+    /// A version and the one that takes its place.
+    pub fn change<M: 'a>(self, from: &'a str, to: &'a str) -> Element<'a, M> {
+        row![
+            self.small(from).wrapping(Wrapping::None),
+            self.sized_icon(Icon::ChevronRight, Tone::Mute, 14.0),
+            self.small(to).style(style::ink(Tone::Live)).wrapping(Wrapping::None),
+        ]
+        .spacing(6)
+        .align_y(Center)
+        .into()
+    }
+
     /// Explains a failure next to the controls it affects.
     pub fn failure<M: 'a>(self, reason: impl IntoFragment<'a>) -> Element<'a, M> {
         self.remark(Icon::Warning, Tone::Warning, reason)

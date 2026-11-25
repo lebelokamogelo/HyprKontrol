@@ -14,11 +14,13 @@ mod options;
 use std::fmt::Debug;
 use std::time::Duration;
 
-use iced::Task;
+use iced::futures::SinkExt;
+use iced::{Subscription, Task, stream};
 
 use crate::config::Config;
 use crate::icon::Icon;
-use crate::sys::{self, Change, Cmd, Op};
+use crate::sys::levels::{Source, Watcher};
+use crate::sys::{self, Change, Cmd, Op, Session};
 use crate::theme::Spec;
 use crate::ui::{Element, Ui};
 
@@ -40,6 +42,8 @@ pub enum Request {
     /// Shows a theme without saving it.
     PreviewTheme(Box<Spec>),
     ReloadThemes,
+    /// Runs a command that shows progress and asks questions.
+    Run(Session),
     Report(sys::Error),
     Done(String),
 }
@@ -84,10 +88,16 @@ impl<M> Effect<M> {
 
     /// Runs a command whose arguments may have been rejected.
     pub fn checked(command: Option<Cmd>) -> Self {
-        match command {
-            Some(command) => Self::run(command),
-            None => Self::request(Request::Report(sys::Error::new("That name is not valid"))),
-        }
+        command.map_or_else(Self::rejected, Self::run)
+    }
+
+    /// Runs a session whose arguments may have been rejected.
+    pub fn session(session: Option<Session>) -> Self {
+        session.map_or_else(Self::rejected, |session| Self::request(Request::Run(session)))
+    }
+
+    fn rejected() -> Self {
+        Self::request(Request::Report(sys::Error::new("That name is not valid")))
     }
 
     pub fn and(mut self, task: Task<M>) -> Self
@@ -130,6 +140,41 @@ pub trait Panel: Default {
     fn watch(&self) -> Watch {
         Watch::Never
     }
+
+    /// What the open panel follows as it happens, such as the volume.
+    ///
+    /// Unlike [`Panel::watch`] this goes on while the window is not focused. It
+    /// has to wait for events and must not poll.
+    fn events(&self) -> Subscription<Self::Message> {
+        Subscription::none()
+    }
+}
+
+/// How long to wait before following a source again that has gone away, as the
+/// sound server does when it is restarted.
+const RETRY: Duration = Duration::from_secs(5);
+
+/// How long changes are ignored after one of our own sliders was let go. What
+/// has been read by then may be from before its final value was applied.
+pub(crate) const SETTLE: Duration = Duration::from_millis(400);
+
+/// Signals when volume or brightness change.
+pub(crate) fn follow(source: Source) -> Subscription<()> {
+    Subscription::run_with(source, |source| {
+        let source = *source;
+        stream::channel(1, async move |mut output| {
+            loop {
+                if let Some(mut watcher) = Watcher::start(source) {
+                    while watcher.changed().await {
+                        if output.send(()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(RETRY).await;
+            }
+        })
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -277,6 +322,10 @@ macro_rules! panels {
 
             pub fn watch(&self, id: Id) -> Watch {
                 match id { $(Id::$id => self.$module.watch()),* }
+            }
+
+            pub fn events(&self, id: Id) -> Subscription<Message> {
+                match id { $(Id::$id => self.$module.events().map(Message::$id)),* }
             }
         }
     };

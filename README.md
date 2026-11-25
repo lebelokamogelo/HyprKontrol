@@ -189,7 +189,12 @@ the first time. [Configuration](docs/CONFIGURATION.md#files-it-writes) lists
 every file that can be written.
 
 **The program never runs as root.** Privileged changes go through polkit one at a time.
-Package operations open in a terminal, where you answer pacman's questions.
+
+**Packages are handled in the window.** Updating, installing and removing show
+their progress in place, with pacman's output one click away. Its questions are
+yours to answer, and nothing is confirmed for you. Until packages start to be
+changed you can stop at any time. AUR packages update in a terminal, where your
+helper shows their build scripts.
 
 **Risky changes time out.** A display mode that is not confirmed within 15
 seconds is reverted, in case you can no longer see the screen.
@@ -198,7 +203,8 @@ seconds is reverted, in case you can no longer see the screen.
 D-Bus and never appear in a process listing.
 
 **It is idle when you are not looking.** Panels refresh only while the window
-has focus.
+has focus. Volume and brightness follow your keys through events, without
+polling.
 
 ## Status
 

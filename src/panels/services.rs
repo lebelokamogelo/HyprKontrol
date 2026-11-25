@@ -21,9 +21,13 @@ pub enum Filter {
     All,
 }
 
+type List = Option<Result<Vec<Service>>>;
+
 #[derive(Default)]
 pub struct State {
-    services: Option<Result<Vec<Service>>>,
+    /// Both lists are kept, so that switching between them takes no time.
+    system: List,
+    user: List,
     scope: Scope,
     filter: Filter,
     query: String,
@@ -43,7 +47,18 @@ pub enum Message {
     Logs(String),
 }
 
+fn read(scope: Scope) -> Task<Message> {
+    Task::perform(services::list(scope), move |list| Message::Loaded(scope, list))
+}
+
 impl State {
+    fn list(&self, scope: Scope) -> &List {
+        match scope {
+            Scope::System => &self.system,
+            Scope::User => &self.user,
+        }
+    }
+
     fn matches(&self, service: &Service) -> bool {
         let query = self.query.trim().to_lowercase();
         // A search covers everything, since the user asked for it by name.
@@ -113,24 +128,30 @@ impl Panel for State {
     type Message = Message;
 
     fn load(&self) -> Task<Message> {
-        let scope = self.scope;
-        Task::perform(services::list(scope), move |list| Message::Loaded(scope, list))
+        let other = match self.scope {
+            Scope::System => Scope::User,
+            Scope::User => Scope::System,
+        };
+        match self.list(other) {
+            Some(_) => read(self.scope),
+            None => Task::batch([read(self.scope), read(other)]),
+        }
     }
 
     fn update(&mut self, message: Message) -> Effect<Message> {
         match message {
             Message::Loaded(scope, services) => {
-                // A slow answer for the other scope must not replace this one.
-                if scope == self.scope {
-                    self.services = Some(services);
+                match scope {
+                    Scope::System => self.system = Some(services),
+                    Scope::User => self.user = Some(services),
                 }
                 Effect::none()
             }
             Message::Scope(scope) => {
                 self.scope = scope;
-                self.services = None;
                 self.selected = None;
-                Effect::task(self.load())
+                // What is known is shown meanwhile.
+                Effect::task(read(scope))
             }
             Message::Filter(filter) => {
                 self.filter = filter;
@@ -181,7 +202,7 @@ impl Panel for State {
             row![search, space().width(Fill), filter].spacing(12).align_y(Center).into()
         };
         let mut body = vec![controls];
-        match &self.services {
+        match self.list(self.scope) {
             None => body.push(ui.loading()),
             Some(Err(error)) => body.push(ui.failure(error.to_string())),
             Some(Ok(services)) => {
@@ -200,16 +221,56 @@ impl Panel for State {
                 });
             }
         }
-        ui.panel("Services", self.summary(), Some(scope), body)
+        // Without a subtitle, the header would change its height and move the
+        // control that has just been pressed.
+        let subtitle = match self.list(self.scope) {
+            None => "Reading".to_owned(),
+            Some(Err(_)) => "Not available".to_owned(),
+            Some(Ok(_)) => self.summary(),
+        };
+        ui.panel("Services", subtitle, Some(scope), body)
     }
 
     fn summary(&self) -> String {
-        let Some(Ok(services)) = &self.services else { return String::new() };
+        let Some(Ok(services)) = self.list(self.scope) else { return String::new() };
         let failed = services.iter().filter(|service| service.failed).count();
         let running = services.iter().filter(|service| service.active).count();
         match failed {
             0 => format!("{running} running"),
             count => format!("{running} running, {count} failed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(unit: &str) -> Service {
+        Service {
+            unit: unit.to_owned(),
+            description: String::new(),
+            active: true,
+            failed: false,
+            state: "enabled".to_owned(),
+        }
+    }
+
+    #[test]
+    fn switching_shows_what_is_known_at_once() {
+        let mut state = State::default();
+        let _ = state.update(Message::Loaded(Scope::System, Ok(vec![service("a.service")])));
+        let _ = state.update(Message::Loaded(
+            Scope::User,
+            Ok(vec![service("b.service"), service("c.service")]),
+        ));
+        assert_eq!(state.summary(), "1 running");
+        let _ = state.update(Message::Scope(Scope::User));
+        assert_eq!(state.summary(), "2 running");
+        // A slow answer for the other scope does not replace this one.
+        let _ = state.update(Message::Loaded(Scope::System, Ok(Vec::new())));
+        assert_eq!(state.summary(), "2 running");
+        let _ = state.update(Message::Scope(Scope::System));
+        assert_eq!(state.summary(), "0 running");
     }
 }
